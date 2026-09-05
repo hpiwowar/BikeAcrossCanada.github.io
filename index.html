@@ -172,6 +172,15 @@ const baseMaps = {
 // tiles and the routes, blended with CSS multiply so it shades the base map
 // without hiding it (see .leaflet-hillshade-pane in <style>).
 map.createPane('hillshade').style.zIndex = 250;
+// Land outside Canada, dimmed: a light grey wash over the US, Alaska,
+// Greenland, St-Pierre and Miquelon, so the map reads as biking across
+// Canada. Sits under the hillshade and routes, ignores clicks. Polygon from
+// Natural Earth (public domain), detailed near the border, coarse far away.
+map.createPane('outside').style.zIndex = 240;
+fetch('data/outside_canada.geojson').then(r => r.json()).then(gj => {
+  L.geoJSON(gj, { pane: 'outside', interactive: false,
+                  style: { stroke: false, fillColor: '#444', fillOpacity: 0.22 } }).addTo(map);
+});
 const MERC = 20037508.342789244;
 const HillshadeLayer = L.TileLayer.extend({
   getTileUrl(coords) {
