@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 
 from pyproj import Geod, Transformer
 from shapely.geometry import LineString, Point, shape
-from shapely.ops import transform, unary_union
+from shapely.ops import substring, transform, unary_union
 from shapely.strtree import STRtree
 
 import elevation
@@ -201,24 +201,87 @@ def track_dir(name):
     return None
 
 
-# A directional (EB/WB) track only *hides* in the opposite-direction view when
+# A directional (EB/WB) track only *hides* in the opposite-direction view where
 # the other direction actually has its own alternative for that stretch —
 # Sam describes routes eastbound, so most EB tracks ARE the route both ways,
 # with WB variants only where one-way streets etc. force a different line.
-PAIR_NEAR_KM = 0.3   # "runs alongside" distance for counterpart detection
-PAIR_COVER = 0.6     # fraction of a track that must run alongside a counterpart
+# The test is per-portion, and every hidden stretch is derived from one
+# specific counterpart track: the along-this-track projection of the stretch
+# of that counterpart that runs within PAIR_NEAR_KM. A long EB file with a
+# short WB variant midway is cut there and hides westbound only beside the
+# variant; a mere crossing projects to a point and hides nothing; and a hidden
+# stretch always starts and ends where its counterpart does, so the visible
+# line in either view never dead-ends away from its alternative.
+PAIR_NEAR_KM = 0.3      # "runs alongside" distance for counterpart detection
+PAIR_MIN_TWIN_KM = 0.2  # projections shorter than this are crossings/noise, not couplets
+PAIR_SAMPLE_M = 100     # counterpart sampling step for the alongside test
 
 
-def has_counterpart(line_m, opposite_tree):
-    """True if most of this track runs close alongside some opposite-direction
-    track (sampled every ~1 km along the line)."""
-    if opposite_tree is None:
-        return False
-    pts = [Point(c) for c in line_m.segmentize(1000).coords]
-    near = sum(1 for p in pts
-               if p.distance(opposite_tree.geometries[opposite_tree.nearest(p)])
-               <= PAIR_NEAR_KM * 1000)
-    return near / len(pts) >= PAIR_COVER
+def counterpart_intervals(line_m, opposite_lines):
+    """Stretches of this track (as (start_m, end_m) along it) that have a
+    specific opposite-direction track running alongside. For each opposite
+    track, its portions within PAIR_NEAR_KM of this line are projected onto
+    this line; a projection spanning at least PAIR_MIN_TWIN_KM (less for a
+    sub-400 m variant stub — its whole twin is shorter than that) marks a
+    stretch where the counterpart replaces this track in the opposite view.
+    Overlapping or touching stretches from different counterparts merge."""
+    if not opposite_lines:
+        return []
+    tree = STRtree(opposite_lines)
+    near_m = PAIR_NEAR_KM * 1000
+    ivals = []
+    for k in tree.query(line_m.buffer(near_m)):
+        opp = opposite_lines[k]
+        # short variant stubs get a proportional bar, but never below 100 m —
+        # a 30 m stub is real for its own tag, yet hiding a 30 m sliver of the
+        # main line would just litter the data with degenerate pieces
+        min_twin = max(100, min(PAIR_MIN_TWIN_KM * 1000, 0.5 * opp.length))
+        run = []
+        for c in list(opp.segmentize(PAIR_SAMPLE_M).coords) + [None]:
+            if c is not None and Point(c).distance(line_m) <= near_m:
+                run.append(c)
+                continue
+            if run:
+                a = line_m.project(Point(run[0]))
+                b = line_m.project(Point(run[-1]))
+                if abs(b - a) >= min_twin:
+                    ivals.append([min(a, b), max(a, b)])
+                run = []
+    ivals.sort()
+    merged = []
+    for iv in ivals:
+        if merged and iv[0] <= merged[-1][1] + 50:
+            merged[-1][1] = max(merged[-1][1], iv[1])
+        else:
+            merged.append(iv)
+    return merged
+
+
+def split_by_direction(simp, line_m, d, ivals):
+    """Cut a directional track at its counterpart-interval edges: pieces with
+    an opposite-direction track alongside keep the dir tag (hide in the
+    opposite view), the rest shows both ways. [(dir_or_None, simp, line_m)...]"""
+    if not ivals:
+        return [(None, simp, line_m)]
+    total = line_m.length
+    if len(ivals) == 1 and ivals[0][0] == 0.0 and ivals[0][1] >= total:
+        return [(d, simp, line_m)]
+    bounds = []
+    prev = 0.0
+    for s0, s1 in ivals:
+        if s0 > prev:
+            bounds.append((prev, s0, None))
+        bounds.append((s0, min(s1, total), d))
+        prev = s1
+    if prev < total:
+        bounds.append((prev, total, None))
+    pieces = []
+    for s0, s1, pd in bounds:
+        if s1 - s0 < 10:  # float-noise sliver at a snapped end, not a real piece
+            continue
+        sub = substring(line_m, s0, s1)
+        pieces.append((pd, LineString(to_deg(sub.coords)), sub))
+    return pieces
 
 
 def convert_routes(provinces):
@@ -246,7 +309,6 @@ def convert_routes(provinces):
         # view) only if the opposite direction has a counterpart alongside
         by_dir = {"E": [t[3] for t in tracks if t[1] == "E"],
                   "W": [t[3] for t in tracks if t[1] == "W"]}
-        trees = {d: (STRtree(ls) if ls else None) for d, ls in by_dir.items()}
         demoted = 0
         feats = []
         layer_km = 0.0   # every track, both directions (double-counts EB/WB couplets)
@@ -255,46 +317,79 @@ def convert_routes(provinces):
         # whole tracks (so provincial splits don't reset the count), rhythm
         # carried through tip-to-tail chains regardless of file order.
         track_shields_all = chain_shields(tracks)
-        for ti, (fname, d, simp, line_m) in enumerate(tracks):
-            if d and not has_counterpart(line_m, trees["W" if d == "E" else "E"]):
-                d = None  # no alternative for the other direction: show both ways
-                demoted += 1
-            provs = prov_tags(line_m, provinces)
-            used_provs.update(provs)
-            track_shields = track_shields_all[ti]
-            def props(pv, km, sh):
-                p = {"name": fname, "provs": pv, "km": round(km, 1)}
-                if d:
-                    p["dir"] = d
-                if sh:
-                    p["shields"] = sh
-                return p
-            if len(provs) > 1:
-                pieces = split_by_province(line_m, provs, provinces)
-                piece_lines = [LineString(projected(coords)) for _, coords in pieces]
-                assigned = [[] for _ in pieces]
-                for lat, lon in track_shields:
+        part_split = 0
+        for ti, (fname, tdir, tsimp, tline_m) in enumerate(tracks):
+            if tdir == "E":
+                # Sam draws the route eastbound, so an EB track without a WB
+                # variant is the route both ways: split it and hide only the
+                # stretches a WB counterpart replaces.
+                ivals = counterpart_intervals(tline_m, by_dir["W"])
+                dir_pieces = split_by_direction(tsimp, tline_m, tdir, ivals)
+                if len(dir_pieces) == 1 and dir_pieces[0][0] is None:
+                    demoted += 1
+                elif len(dir_pieces) > 1:
+                    part_split += 1
+            elif tdir == "W":
+                # A WB track is always a deliberate one-way routing, never the
+                # shared line — keep it whole and westbound-only. Splitting one
+                # strands its far-from-the-EB middle as a dangling two-way
+                # fragment in the eastbound view. Demote only a WB track with
+                # no EB alongside at all (mislabel / isolated loop): hiding
+                # that one could leave eastbound with nothing there.
+                if counterpart_intervals(tline_m, by_dir["E"]):
+                    dir_pieces = [("W", tsimp, tline_m)]
+                else:
+                    dir_pieces = [(None, tsimp, tline_m)]
+                    demoted += 1
+            else:
+                dir_pieces = [(None, tsimp, tline_m)]
+            # a split track's shields go to whichever piece each sits on
+            all_shields = track_shields_all[ti]
+            if len(dir_pieces) == 1:
+                piece_shields = [all_shields]
+            else:
+                piece_shields = [[] for _ in dir_pieces]
+                for lat, lon in all_shields:
                     pt = Point(projected([[lon, lat]])[0])
-                    nearest = min(range(len(pieces)),
-                                  key=lambda i: piece_lines[i].distance(pt))
-                    assigned[nearest].append([lat, lon])
-                for (pc, coords), sh in zip(pieces, assigned):
-                    piece_km = geod_km(coords)
-                    layer_km += piece_km
+                    k = min(range(len(dir_pieces)),
+                            key=lambda i: dir_pieces[i][2].distance(pt))
+                    piece_shields[k].append([lat, lon])
+            for (d, simp, line_m), track_shields in zip(dir_pieces, piece_shields):
+                provs = prov_tags(line_m, provinces)
+                used_provs.update(provs)
+                def props(pv, km, sh):
+                    p = {"name": fname, "provs": pv, "km": round(km, 1)}
+                    if d:
+                        p["dir"] = d
+                    if sh:
+                        p["shields"] = sh
+                    return p
+                if len(provs) > 1:
+                    pieces = split_by_province(line_m, provs, provinces)
+                    piece_lines = [LineString(projected(coords)) for _, coords in pieces]
+                    assigned = [[] for _ in pieces]
+                    for lat, lon in track_shields:
+                        pt = Point(projected([[lon, lat]])[0])
+                        nearest = min(range(len(pieces)),
+                                      key=lambda i: piece_lines[i].distance(pt))
+                        assigned[nearest].append([lat, lon])
+                    for (pc, coords), sh in zip(pieces, assigned):
+                        piece_km = geod_km(coords)
+                        layer_km += piece_km
+                        feats.append({
+                            "type": "Feature",
+                            "properties": props([pc], piece_km, sh),
+                            "geometry": {"type": "LineString", "coordinates": coords},
+                        })
+                else:
+                    track_km = geod_km(simp.coords)
+                    layer_km += track_km
                     feats.append({
                         "type": "Feature",
-                        "properties": props([pc], piece_km, sh),
-                        "geometry": {"type": "LineString", "coordinates": coords},
+                        "properties": props(provs, track_km, track_shields),
+                        "geometry": {"type": "LineString",
+                                     "coordinates": rounded(simp.coords)},
                     })
-            else:
-                track_km = geod_km(simp.coords)
-                layer_km += track_km
-                feats.append({
-                    "type": "Feature",
-                    "properties": props(provs, track_km, track_shields),
-                    "geometry": {"type": "LineString",
-                                 "coordinates": rounded(simp.coords)},
-                })
         # Elevation bake (issue #38): climb totals onto each track's properties
         # + the profile sidecar the chart reads. CW is the ferry layer — the
         # crossings are water, a profile would be noise.
@@ -307,6 +402,8 @@ def convert_routes(provinces):
                                        separators=(",", ":")))
         if demoted:
             print(f"  {code}: {demoted} EB/WB tracks have no counterpart -> shown both directions")
+        if part_split:
+            print(f"  {code}: {part_split} EB/WB tracks split — counterpart alongside only part of the track")
         sizes[code] = (len(feats), out_path.stat().st_size, layer_km, we_km)
     return sizes, geoms, used_provs
 
