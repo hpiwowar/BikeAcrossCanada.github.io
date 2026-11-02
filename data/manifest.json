@@ -63,6 +63,15 @@
    "count": 30,
    "km": 1510,
    "km_west_east": 1500
+  },
+  {
+   "code": "C",
+   "color": "303030",
+   "weight": 4,
+   "title": "C- Network Dedicated Cycling Infrastructure (approx. 100 km)",
+   "count": 50,
+   "km": 88,
+   "km_west_east": 100
   }
  ],
  "pois": [
@@ -190,7 +199,7 @@
   {
    "key": "Toilets",
    "emoji": "\ud83d\udebb",
-   "title": "Toilets",
+   "title": "Toilets (Public Rest Areas)",
    "count": 467
   },
   {
@@ -227,7 +236,7 @@
    "key": "Warning_Caution_Note",
    "emoji": "\u26a0\ufe0f",
    "title": "Warnings & cautions",
-   "count": 434
+   "count": 335
   },
   {
    "key": "Camera_Stop",
